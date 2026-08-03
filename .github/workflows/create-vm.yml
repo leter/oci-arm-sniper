@@ -5,6 +5,10 @@ on:
     - cron: "*/5 * * * *"
   # Allows you to manually run this workflow from the Actions tab
   workflow_dispatch:
+permissions:
+  actions: write
+  contents: read
+concurrency: oci-arm-sniper
 env:
   COMPARTMENT_ID: ${{ secrets.OCI_COMPARTMENT_ID }}
   IMAGE_ID: ${{ secrets.IMAGE_ID }}
@@ -56,12 +60,12 @@ jobs:
             --compartment-id "$COMPARTMENT_ID" \
             --availability-domain "$AD_NAME" \
             --shape "VM.Standard.A1.Flex" \
-            --shape-config '{"ocpus":1,"memoryInGBs":6}' \
+            --shape-config '{"ocpus":4,"memoryInGBs":24}' \
             --subnet-id "$SUBNET_ID" \
             --image-id "$IMAGE_ID" \
             --ssh-authorized-keys-file "/home/runner/my_ssh_key.pub" \
             --assign-public-ip true \
-            --display-name "englishpod-vm" \
+            --display-name "oci-a1-max" \
             --boot-volume-size-in-gbs 100 2>&1 || true)
 
           # Store the log as a GitHub step output
@@ -103,3 +107,9 @@ jobs:
             ```json
             ${{ steps.create_vm.outputs.log_data }}
             ```
+
+      - name: Stop retrying after successful launch
+        if: steps.create_vm.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api --method PUT "repos/$GITHUB_REPOSITORY/actions/workflows/create-vm.yml/disable"
