@@ -73,26 +73,20 @@ jobs:
           echo "$OCI_OUTPUT" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
-          # Decide whether to notify:
-          #   success            -> notify (you grabbed an instance!)
-          #   no capacity/quota  -> silent (routine, will retry next run)
-          #   any other error    -> notify (real problem worth your attention)
+          # Only a successful launch triggers a notification.
           if echo "$OCI_OUTPUT" | grep -q '"lifecycle-state": "PROVISIONING"'; then
-            echo "should_notify=true" >> $GITHUB_OUTPUT
             echo "Success! 'PROVISIONING' state found in output."
             exit 0
           elif echo "$OCI_OUTPUT" | grep -Eqi 'Out of host capacity|"code": "LimitExceeded"'; then
-            echo "should_notify=false" >> $GITHUB_OUTPUT
             echo "Capacity or quota is unavailable. Staying quiet and will retry."
             exit 1
           else
-            echo "should_notify=true" >> $GITHUB_OUTPUT
-            echo "Unexpected error. Notifying."
+            echo "Unexpected error. Staying quiet and will retry."
             exit 1
           fi
 
       - name: Send Discord Notification
-        if: steps.create_vm.outputs.should_notify == 'true'
+        if: steps.create_vm.outcome == 'success'
         uses: sarisia/actions-status-discord@v1.15.4
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_URL }}
