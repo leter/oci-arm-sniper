@@ -75,15 +75,15 @@ jobs:
 
           # Decide whether to notify:
           #   success            -> notify (you grabbed an instance!)
-          #   out of capacity    -> silent (routine, will retry next run)
+          #   no capacity/quota  -> silent (routine, will retry next run)
           #   any other error    -> notify (real problem worth your attention)
           if echo "$OCI_OUTPUT" | grep -q '"lifecycle-state": "PROVISIONING"'; then
             echo "should_notify=true" >> $GITHUB_OUTPUT
             echo "Success! 'PROVISIONING' state found in output."
             exit 0
-          elif echo "$OCI_OUTPUT" | grep -qi 'Out of host capacity'; then
+          elif echo "$OCI_OUTPUT" | grep -Eqi 'Out of host capacity|"code": "LimitExceeded"'; then
             echo "should_notify=false" >> $GITHUB_OUTPUT
-            echo "Out of host capacity. Staying quiet and will retry."
+            echo "Capacity or quota is unavailable. Staying quiet and will retry."
             exit 1
           else
             echo "should_notify=true" >> $GITHUB_OUTPUT
