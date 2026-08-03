@@ -5,6 +5,11 @@ on:
     - cron: "*/5 * * * *"
   # Allows you to manually run this workflow from the Actions tab
   workflow_dispatch:
+    inputs:
+      test_notification:
+        description: Send a Discord test notification without creating a VM
+        type: boolean
+        default: false
 permissions:
   actions: write
   contents: read
@@ -21,7 +26,20 @@ env:
   OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
 
 jobs:
+  test-notification:
+    if: inputs.test_notification
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Discord Test Notification
+        uses: sarisia/actions-status-discord@v1.15.4
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          title: OCI Sniper Test Notification
+          status: success
+          description: Discord notifications are working.
+
   build-and-deploy:
+    if: ${{ !inputs.test_notification }}
     runs-on: ubuntu-latest
     steps:
       - name: Cache pip packages
