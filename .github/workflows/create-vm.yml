@@ -1,5 +1,7 @@
 name: Try to Create OCI VM
-# It will run every 5 minutes.
+# GitHub will not schedule a workflow more often than every 5 minutes.
+# Each run makes a few spaced LaunchInstance calls (~90s apart) to fill that window
+# without bursting under OCI user-rate throttling (429 TooManyRequests).
 on:
   schedule:
     - cron: "*/5 * * * *"
@@ -56,6 +58,9 @@ jobs:
         id: create_vm
         # This forces the job to succeed so the cache will save.
         continue-on-error: true
+        env:
+          SNIPER_ATTEMPTS: 3
+          SNIPER_INTERVAL_SEC: 90
         run: |
           set -o pipefail
 
@@ -73,35 +78,53 @@ jobs:
           echo "region=${{ env.OCI_CLI_REGION }}" >> ~/.oci/config
           echo "${{ secrets.SSH_PUBLIC_KEY }}" > /home/runner/my_ssh_key.pub
 
-          # Run the command, capture ALL output, and use '|| true' to prevent the script from exiting early.
-          OCI_OUTPUT=$(oci compute instance launch \
-            --compartment-id "$COMPARTMENT_ID" \
-            --availability-domain "$AD_NAME" \
-            --shape "VM.Standard.A1.Flex" \
-            --shape-config '{"ocpus":2,"memoryInGBs":12}' \
-            --subnet-id "$SUBNET_ID" \
-            --image-id "$IMAGE_ID" \
-            --ssh-authorized-keys-file "/home/runner/my_ssh_key.pub" \
-            --assign-public-ip true \
-            --display-name "oci-a1-max" \
-            --boot-volume-size-in-gbs 100 2>&1 || true)
+          OCI_OUTPUT=""
+          i=1
+          while [ "$i" -le "$SNIPER_ATTEMPTS" ]; do
+            echo "Attempt $i/$SNIPER_ATTEMPTS"
 
-          # Store the log as a GitHub step output
+            # Capture ALL output, and use '|| true' to prevent the script from exiting early.
+            OCI_OUTPUT=$(oci compute instance launch \
+              --compartment-id "$COMPARTMENT_ID" \
+              --availability-domain "$AD_NAME" \
+              --shape "VM.Standard.A1.Flex" \
+              --shape-config '{"ocpus":2,"memoryInGBs":12}' \
+              --subnet-id "$SUBNET_ID" \
+              --image-id "$IMAGE_ID" \
+              --ssh-authorized-keys-file "/home/runner/my_ssh_key.pub" \
+              --assign-public-ip true \
+              --display-name "oci-a1-max" \
+              --boot-volume-size-in-gbs 100 2>&1 || true)
+
+            if echo "$OCI_OUTPUT" | grep -q '"lifecycle-state": "PROVISIONING"'; then
+              echo "Success! 'PROVISIONING' state found in output."
+              break
+            elif echo "$OCI_OUTPUT" | grep -Eqi 'TooManyRequests|User-rate limit exceeded'; then
+              echo "Rate limited on attempt $i. Skipping remaining attempts this run."
+              break
+            elif echo "$OCI_OUTPUT" | grep -Eqi 'Out of host capacity|"code": "LimitExceeded"'; then
+              echo "Capacity or quota is unavailable on attempt $i. Staying quiet and will retry."
+            else
+              echo "Unexpected error on attempt $i. Staying quiet and will retry."
+            fi
+
+            if [ "$i" -lt "$SNIPER_ATTEMPTS" ]; then
+              echo "Sleeping ${SNIPER_INTERVAL_SEC}s before retry..."
+              sleep "$SNIPER_INTERVAL_SEC"
+            fi
+            i=$((i + 1))
+          done
+
+          # Store the last attempt log as a GitHub step output
           echo "log_data<<EOF" >> $GITHUB_OUTPUT
           echo "$OCI_OUTPUT" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
           # Only a successful launch triggers a notification.
           if echo "$OCI_OUTPUT" | grep -q '"lifecycle-state": "PROVISIONING"'; then
-            echo "Success! 'PROVISIONING' state found in output."
             exit 0
-          elif echo "$OCI_OUTPUT" | grep -Eqi 'Out of host capacity|"code": "LimitExceeded"'; then
-            echo "Capacity or quota is unavailable. Staying quiet and will retry."
-            exit 1
-          else
-            echo "Unexpected error. Staying quiet and will retry."
-            exit 1
           fi
+          exit 1
 
       - name: Send Discord Notification
         if: steps.create_vm.outcome == 'success'
