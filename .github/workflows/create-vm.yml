@@ -8,14 +8,33 @@ on:
   # Allows you to manually run this workflow from the Actions tab
   workflow_dispatch:
     inputs:
-      test_notification:
-        description: Send a Discord test notification without creating a VM
+      diagnose_only:
+        description: "Only inspect existing instances & storage (no VM created)"
         type: boolean
         default: false
+      test_notification:
+        description: "Send a Discord test notification without creating a VM"
+        type: boolean
+        default: false
+      ocpus:
+        description: "OCPUs for A1.Flex (free limit total: 4)"
+        type: string
+        default: "2"
+      memory_in_gbs:
+        description: "Memory in GBs for A1.Flex (free limit total: 24)"
+        type: string
+        default: "12"
+      boot_volume_size:
+        description: "Boot volume size in GBs (free limit total: 200)"
+        type: string
+        default: "50"
+
 permissions:
   actions: write
   contents: read
+
 concurrency: oci-arm-sniper
+
 env:
   COMPARTMENT_ID: ${{ secrets.OCI_COMPARTMENT_ID }}
   IMAGE_ID: ${{ secrets.IMAGE_ID }}
@@ -26,6 +45,11 @@ env:
   OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
   OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
   OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
+  DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+  TARGET_OCPUS: ${{ inputs.ocpus || '2' }}
+  TARGET_MEMORY_GBS: ${{ inputs.memory_in_gbs || '12' }}
+  TARGET_BOOT_GBS: ${{ inputs.boot_volume_size || '50' }}
+  DIAGNOSE_ONLY: ${{ inputs.diagnose_only || false }}
 
 jobs:
   test-notification:
@@ -54,16 +78,10 @@ jobs:
       - name: Add OCI CLI to path
         run: echo "$HOME/.local/bin" >> $GITHUB_PATH
 
-      - name: Setup OCI CLI and Try to Create VM
-        id: create_vm
-        # This forces the job to succeed so the cache will save.
-        continue-on-error: true
-        env:
-          SNIPER_ATTEMPTS: 3
-          SNIPER_INTERVAL_SEC: 90
+      - name: Setup OCI CLI & Run Account Diagnostics
+        id: setup_and_diag
         run: |
-          set -o pipefail
-
+          set -euo pipefail
           pip install oci-cli
 
           mkdir -p ~/.oci
@@ -78,34 +96,131 @@ jobs:
           echo "region=${{ env.OCI_CLI_REGION }}" >> ~/.oci/config
           echo "${{ secrets.SSH_PUBLIC_KEY }}" > /home/runner/my_ssh_key.pub
 
-          OCI_OUTPUT=""
-          i=1
-          while [ "$i" -le "$SNIPER_ATTEMPTS" ]; do
-            echo "Attempt $i/$SNIPER_ATTEMPTS"
+          echo "## 📊 OCI Account Diagnostic Summary" >> $GITHUB_STEP_SUMMARY
 
-            # Capture ALL output, and use '|| true' to prevent the script from exiting early.
+          python3 - << 'PY'
+          import json, os, subprocess
+
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+          comp_id = os.environ.get("COMPARTMENT_ID")
+          ad_name = os.environ.get("AD_NAME")
+
+          def run_cmd(cmd):
+              try:
+                  res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+                  return json.loads(res.stdout).get("data", [])
+              except Exception as e:
+                  print(f"Error running {' '.join(cmd)}: {e}")
+                  return None
+
+          # 1. Check Instances
+          print("\n=== [1/2] Checking Existing Instances in Tenancy ===")
+          inst_data = run_cmd(["oci", "compute", "instance", "list", "--compartment-id", comp_id, "--output", "json"])
+          active_insts = []
+          if inst_data is not None:
+              active_insts = [i for i in inst_data if i.get("lifecycle-state") not in ("TERMINATED",)]
+              print(f"Found {len(active_insts)} active/non-terminated instance(s):")
+              with open(summary_path, "a", encoding="utf-8") as f:
+                  f.write(f"\n### 🖥️ Active Instances ({len(active_insts)})\n\n")
+                  if active_insts:
+                      f.write("| Name | State | Shape | OCPUs | RAM (GB) |\n")
+                      f.write("| --- | --- | --- | --- | --- |\n")
+                      for inst in active_insts:
+                          name = inst.get("display-name", "unknown")
+                          state = inst.get("lifecycle-state", "unknown")
+                          shape = inst.get("shape", "unknown")
+                          cfg = inst.get("shape-config", {})
+                          ocpus = cfg.get("ocpus", "N/A")
+                          ram = cfg.get("memory-in-gbs", "N/A")
+                          print(f"  * {name} ({state}) - {shape}, {ocpus} OCPUs, {ram} GB RAM")
+                          f.write(f"| `{name}` | **{state}** | {shape} | {ocpus} | {ram} |\n")
+                  else:
+                      f.write("*No existing instances found.*\n")
+
+          # 2. Check Boot Volumes
+          print("\n=== [2/2] Checking Existing Boot Volumes in AD ===")
+          bv_data = run_cmd(["oci", "bv", "boot-volume", "list", "--compartment-id", comp_id, "--availability-domain", ad_name, "--output", "json"])
+          if bv_data is not None:
+              active_bvs = [b for b in bv_data if b.get("lifecycle-state") not in ("TERMINATED",)]
+              total_gb = sum(b.get("size-in-gbs", 0) for b in active_bvs)
+              print(f"Found {len(active_bvs)} active boot volume(s), Total size: {total_gb} GB / 200 GB Free Tier limit")
+              with open(summary_path, "a", encoding="utf-8") as f:
+                  f.write(f"\n### 💾 Boot Volumes ({len(active_bvs)})\n\n")
+                  f.write(f"**Total Volume Used:** `{total_gb} GB / 200 GB` (Free limit)\n\n")
+                  if active_bvs:
+                      f.write("| Volume Name | State | Size (GB) |\n")
+                      f.write("| --- | --- | --- |\n")
+                      for b in active_bvs:
+                          vname = b.get("display-name", "unknown")
+                          vstate = b.get("lifecycle-state", "unknown")
+                          vsize = b.get("size-in-gbs", 0)
+                          print(f"  * {vname} ({vstate}) - {vsize} GB")
+                          f.write(f"| `{vname}` | **{vstate}** | {vsize} GB |\n")
+                  else:
+                      f.write("*No boot volumes found.*\n")
+          PY
+
+      - name: Setup OCI CLI and Try to Create VM
+        id: create_vm
+        if: ${{ env.DIAGNOSE_ONLY != 'true' }}
+        continue-on-error: true
+        env:
+          SNIPER_ATTEMPTS: 3
+          SNIPER_INTERVAL_SEC: 90
+        run: |
+          set -o pipefail
+
+          echo "## 🚀 VM Launch Attempt Results" >> $GITHUB_STEP_SUMMARY
+          echo "Target Shape: \`VM.Standard.A1.Flex\` (${TARGET_OCPUS} OCPU, ${TARGET_MEMORY_GBS} GB RAM, ${TARGET_BOOT_GBS} GB Boot Volume)" >> $GITHUB_STEP_SUMMARY
+
+          OCI_OUTPUT=""
+          ERROR_TYPE=""
+          ERROR_MSG=""
+          i=1
+
+          while [ "$i" -le "$SNIPER_ATTEMPTS" ]; do
+            echo "--- Attempt $i/$SNIPER_ATTEMPTS ---"
+
             OCI_OUTPUT=$(oci compute instance launch \
               --compartment-id "$COMPARTMENT_ID" \
               --availability-domain "$AD_NAME" \
               --shape "VM.Standard.A1.Flex" \
-              --shape-config '{"ocpus":2,"memoryInGBs":12}' \
+              --shape-config "{\"ocpus\":${TARGET_OCPUS},\"memoryInGBs\":${TARGET_MEMORY_GBS}}" \
               --subnet-id "$SUBNET_ID" \
               --image-id "$IMAGE_ID" \
               --ssh-authorized-keys-file "/home/runner/my_ssh_key.pub" \
               --assign-public-ip true \
               --display-name "oci-a1-max" \
-              --boot-volume-size-in-gbs 100 2>&1 || true)
+              --boot-volume-size-in-gbs "$TARGET_BOOT_GBS" 2>&1 || true)
 
             if echo "$OCI_OUTPUT" | grep -q '"lifecycle-state": "PROVISIONING"'; then
-              echo "Success! 'PROVISIONING' state found in output."
+              echo "✅ Success! 'PROVISIONING' state found in output."
+              ERROR_TYPE="SUCCESS"
+              echo "### 🎉 Success: VM is PROVISIONING!" >> $GITHUB_STEP_SUMMARY
               break
+            elif echo "$OCI_OUTPUT" | grep -Eqi '"code": "LimitExceeded"'; then
+              ERROR_TYPE="LIMIT_EXCEEDED"
+              ERROR_MSG=$(echo "$OCI_OUTPUT" | grep -o '"message": "[^"]*"' | head -1 || echo "$OCI_OUTPUT")
+              echo "::error::❌ 配额超限 (LimitExceeded): $ERROR_MSG"
+              echo "### ❌ Quota Limit Exceeded" >> $GITHUB_STEP_SUMMARY
+              echo "Oracle API returned \`LimitExceeded\`: \`$ERROR_MSG\`" >> $GITHUB_STEP_SUMMARY
+              echo "Please check your existing instances or boot volumes in the Oracle Console." >> $GITHUB_STEP_SUMMARY
+              break
+            elif echo "$OCI_OUTPUT" | grep -Eqi 'Out of host capacity'; then
+              ERROR_TYPE="OUT_OF_CAPACITY"
+              echo "⏳ 机房暂无库存 (Out of host capacity) on attempt $i. Normal waiting state, will retry next schedule."
             elif echo "$OCI_OUTPUT" | grep -Eqi 'TooManyRequests|User-rate limit exceeded'; then
-              echo "Rate limited on attempt $i. Skipping remaining attempts this run."
+              ERROR_TYPE="RATE_LIMITED"
+              echo "⚠️ Rate limited on attempt $i. Skipping remaining attempts this run."
               break
-            elif echo "$OCI_OUTPUT" | grep -Eqi 'Out of host capacity|"code": "LimitExceeded"'; then
-              echo "Capacity or quota is unavailable on attempt $i. Staying quiet and will retry."
             else
-              echo "Unexpected error on attempt $i. Staying quiet and will retry."
+              ERROR_TYPE="UNEXPECTED_ERROR"
+              ERROR_MSG=$(echo "$OCI_OUTPUT" | tr '\n' ' ' | head -c 300)
+              echo "::error::⚠️ Unexpected error on attempt $i: $OCI_OUTPUT"
+              echo "### ⚠️ Unexpected Error" >> $GITHUB_STEP_SUMMARY
+              echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+              echo "$OCI_OUTPUT" >> $GITHUB_STEP_SUMMARY
+              echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
             fi
 
             if [ "$i" -lt "$SNIPER_ATTEMPTS" ]; then
@@ -115,33 +230,55 @@ jobs:
             i=$((i + 1))
           done
 
-          # Store the last attempt log as a GitHub step output
+          if [ "$ERROR_TYPE" = "OUT_OF_CAPACITY" ]; then
+            echo "### ⏳ Out of Host Capacity" >> $GITHUB_STEP_SUMMARY
+            echo "Phoenix ($AD_NAME) has no free ARM capacity currently. Sniper is continuously waiting for stock." >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "error_type=$ERROR_TYPE" >> $GITHUB_OUTPUT
+          echo "error_msg<<EOF" >> $GITHUB_OUTPUT
+          echo "$ERROR_MSG" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
           echo "log_data<<EOF" >> $GITHUB_OUTPUT
           echo "$OCI_OUTPUT" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
-          # Only a successful launch triggers a notification.
-          if echo "$OCI_OUTPUT" | grep -q '"lifecycle-state": "PROVISIONING"'; then
+          if [ "$ERROR_TYPE" = "SUCCESS" ]; then
             exit 0
           fi
           exit 1
 
-      - name: Send Discord Notification
+      - name: Send Discord Notification on Success
         if: steps.create_vm.outcome == 'success'
         uses: sarisia/actions-status-discord@v1.15.4
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          title: "OCI VM Status: ${{ steps.create_vm.outcome }}"
-          status: ${{ steps.create_vm.outcome }}
-          color: ${{ steps.create_vm.outcome == 'success' && '0x28a745' || '0xdc3545' }}
+          title: "🎉 OCI ARM VM Created Successfully!"
+          status: success
+          color: '0x28a745'
           description: |
-            Attempt to create A1.Flex VM.
-            **Status:** `${{ steps.create_vm.outcome }}`
+            A1.Flex instance \`oci-a1-max\` is now **PROVISIONING**!
+            **Config:** ${{ env.TARGET_OCPUS }} OCPU / ${{ env.TARGET_MEMORY_GBS }} GB RAM / ${{ env.TARGET_BOOT_GBS }} GB Boot Volume
 
             **Log Output:**
             ```json
             ${{ steps.create_vm.outputs.log_data }}
             ```
+
+      - name: Alert Discord on Fatal Quota Error
+        if: steps.create_vm.outputs.error_type == 'LIMIT_EXCEEDED'
+        uses: sarisia/actions-status-discord@v1.15.4
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          title: "🚨 OCI Sniper Alert: Quota Limit Exceeded"
+          status: failure
+          color: '0xdc3545'
+          description: |
+            **Account quota exceeded! Retrying will not succeed automatically.**
+            Please check boot volumes or instance count in the Oracle Cloud Console.
+
+            **Details:**
+            ${{ steps.create_vm.outputs.error_msg }}
 
       - name: Stop retrying after successful launch
         if: steps.create_vm.outcome == 'success'

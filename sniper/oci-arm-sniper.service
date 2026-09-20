@@ -1,0 +1,21 @@
+[Unit]
+Description=OCI ARM A1 sniper
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+Restart=on-failure
+RestartSec=20
+TimeoutStartSec=0
+ExecStartPre=-/usr/bin/docker rm -f oci-arm-sniper
+ExecStart=/usr/bin/docker run --name oci-arm-sniper --rm \
+    --env-file /opt/oci-arm-sniper/.env \
+    -v /opt/oci-arm-sniper/oci_api_key.pem:/run/oci/oci_api_key.pem:ro \
+    -v /opt/oci-arm-sniper/ssh.pub:/run/oci/ssh.pub:ro \
+    -v /opt/oci-arm-sniper/logs:/var/log/sniper \
+    oci-arm-sniper:latest
+ExecStop=/usr/bin/docker stop oci-arm-sniper
+
+[Install]
+WantedBy=multi-user.target

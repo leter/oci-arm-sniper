@@ -1,0 +1,5 @@
+.env
+oci_api_key.pem
+ssh.pub
+logs/
+last-output.log
