@@ -52,7 +52,7 @@ payload = {
 req = urllib.request.Request(
     url,
     data=json.dumps(payload).encode(),
-    headers={"Content-Type": "application/json"},
+    headers={"Content-Type": "application/json", "User-Agent": "OCI-Sniper/1.0"},
     method="POST",
 )
 with urllib.request.urlopen(req, timeout=20) as resp:
@@ -97,7 +97,6 @@ attempt() {
     --display-name "$DISPLAY_NAME" \
     --boot-volume-size-in-gbs "$BOOT_GBS" 2>&1)
   rc=$?
-  set -e
 
   printf '%s\n' "$output" > "$LOG_DIR/last-output.log"
 
@@ -147,10 +146,8 @@ run_loop() {
   while true; do
     n=$((n + 1))
     log "attempt #$n"
-    set +e
-    attempt
-    status=$?
-    set -e
+    status=0
+    attempt || status=$?
     if [[ "$status" -eq 0 ]]; then
       log "stopping after successful launch"
       return 0
