@@ -83,11 +83,12 @@ EOF
 }
 
 attempt() {
+  local ad="${1:-$AD_NAME}"
   local output rc
   set +e
   output=$(oci compute instance launch \
     --compartment-id "$OCI_COMPARTMENT_ID" \
-    --availability-domain "$AD_NAME" \
+    --availability-domain "$ad" \
     --shape "$SHAPE" \
     --shape-config "{\"ocpus\":${OCPUS},\"memoryInGBs\":${MEMORY_GBS}}" \
     --subnet-id "$OCI_SUBNET_ID" \
@@ -101,9 +102,9 @@ attempt() {
   printf '%s\n' "$output" > "$LOG_DIR/last-output.log"
 
   if printf '%s\n' "$output" | grep -q '"lifecycle-state": "PROVISIONING"'; then
-    log "SUCCESS: instance $DISPLAY_NAME is PROVISIONING"
-    notify_discord "OCI VM grabbed: $DISPLAY_NAME" \
-      "Shape ${SHAPE} ${OCPUS} OCPU / ${MEMORY_GBS} GB is PROVISIONING." 3066993
+    log "SUCCESS: instance $DISPLAY_NAME is PROVISIONING in $ad"
+    notify_discord "OCI VM grabbed: $DISPLAY_NAME ($ad)" \
+      "Shape ${SHAPE} ${OCPUS} OCPU / ${MEMORY_GBS} GB is PROVISIONING in ${ad}." 3066993
     return 0
   fi
 
@@ -116,13 +117,13 @@ attempt() {
   fi
 
   if printf '%s\n' "$output" | grep -Eqi 'Out of host capacity'; then
-    log "retry: capacity unavailable (Out of host capacity) (oci exit $rc)"
+    log "retry [$ad]: capacity unavailable (Out of host capacity) (oci exit $rc)"
     return 2
   fi
 
   local snippet
   snippet=$(printf '%s\n' "$output" | tr '\n' ' ' | head -c 400)
-  log "retry: unexpected error (oci exit $rc): $snippet"
+  log "retry [$ad]: unexpected error (oci exit $rc): $snippet"
   maybe_notify_unexpected "$snippet"
   return 3
 }
@@ -142,20 +143,23 @@ maybe_notify_unexpected() {
 
 run_loop() {
   local n=0 status
-  log "starting loop interval=${INTERVAL}s shape=${SHAPE} ocpus=${OCPUS} memory=${MEMORY_GBS} name=${DISPLAY_NAME}"
+  IFS=', ' read -r -a ad_list <<< "$AD_NAME"
+  log "starting loop interval=${INTERVAL}s shape=${SHAPE} ocpus=${OCPUS} memory=${MEMORY_GBS} name=${DISPLAY_NAME} ADs=${ad_list[*]}"
   while true; do
-    n=$((n + 1))
-    log "attempt #$n"
-    status=0
-    attempt || status=$?
-    if [[ "$status" -eq 0 ]]; then
-      log "stopping after successful launch"
-      return 0
-    elif [[ "$status" -eq 4 ]]; then
-      log "halting loop: quota limit exceeded. Resolve in Oracle Cloud Console before resuming."
-      return 1
-    fi
-    sleep "$INTERVAL"
+    for ad in "${ad_list[@]}"; do
+      n=$((n + 1))
+      log "attempt #$n targeting $ad"
+      status=0
+      attempt "$ad" || status=$?
+      if [[ "$status" -eq 0 ]]; then
+        log "stopping after successful launch"
+        return 0
+      elif [[ "$status" -eq 4 ]]; then
+        log "halting loop: quota limit exceeded. Resolve in Oracle Cloud Console before resuming."
+        return 1
+      fi
+      sleep "$INTERVAL"
+    done
   done
 }
 
